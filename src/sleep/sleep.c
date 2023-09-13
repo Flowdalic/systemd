@@ -318,6 +318,39 @@ static int execute(
         return r;
 }
 
+// Calculate the suspend interval before hibernation based on hibernate time range (e.g., 22:00..06:00).
+static usec_t calc_suspend_interval(struct tm *tm, int start_hour, int start_min, int stop_hour, int stop_min) {
+        int second_of_day = (tm->tm_hour * 60 * 60) + (tm->tm_min * 60) + tm->tm_sec;
+
+        int start_secs = (start_hour * 60 * 60) + (start_min * 60);
+        int stop_secs = (stop_hour * 60 * 60) + (stop_min * 60);
+
+        bool before_start = second_of_day < start_secs;
+        bool after_stop = second_of_day > stop_secs;
+
+        if (start_secs < stop_secs) {
+                if (!before_start && !after_stop)
+                        // We are in the hibernate time range.
+                        return 0;
+
+        } else {
+                if ((before_start && !after_stop) || (!before_start && after_stop))
+                        // We are in the hibernate time range.
+                        return 0;
+
+        }
+
+        int suspend_secs;
+        if (second_of_day <= start_secs)
+                suspend_secs = start_secs - second_of_day;
+        else {
+                int SECS_PER_DAY = 24 * 60 * 60;
+                suspend_secs = (SECS_PER_DAY - second_of_day) + start_secs;
+        }
+
+        return suspend_secs * USEC_PER_SEC;
+}
+
 static int custom_timer_suspend(const SleepConfig *sleep_config) {
         usec_t hibernate_timestamp;
         int r;
@@ -342,11 +375,24 @@ static int custom_timer_suspend(const SleepConfig *sleep_config) {
                 if (r < 0)
                         return log_error_errno(r, "Error fetching battery capacity percentage: %m");
 
-                if (hashmap_isempty(last_capacity))
-                        /* In case of no battery, system suspend interval will be set to HibernateDelaySec= or 2 hours. */
-                        suspend_interval = timestamp_is_set(hibernate_timestamp)
-                                           ? sleep_config->hibernate_delay_usec : DEFAULT_HIBERNATE_DELAY_USEC_NO_BATTERY;
-                else {
+                if (hashmap_isempty(last_capacity)) {
+                        suspend_interval = 0;
+                        /* In case of no battery, system suspend interval will be set to HibernateDelaySec= or 2 hours.
+                         * If a hibernate time range is set, then it will also be considered. */
+                        if (true) {
+                                time_t t = (time_t) (now(CLOCK_REALTIME) / USEC_PER_SEC);
+
+                                struct tm tm;
+                                if (!localtime_r(&t, &tm))
+                                        return log_error_errno(r, "Error calling localtime_r(): %m");
+
+                                suspend_interval = calc_suspend_interval(&tm, 22, 0, 6, 0);
+                        }
+
+                        if (!suspend_interval)
+                                suspend_interval = timestamp_is_set(hibernate_timestamp)
+                                        ? sleep_config->hibernate_delay_usec : DEFAULT_HIBERNATE_DELAY_USEC_NO_BATTERY;
+                } else {
                         r = get_total_suspend_interval(last_capacity, &suspend_interval);
                         if (r < 0) {
                                 log_debug_errno(r, "Failed to estimate suspend interval using previous discharge rate, ignoring: %m");
